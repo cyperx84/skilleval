@@ -14,8 +14,18 @@ A skill alone always fires. None of them answer the question that actually bites
 `skilleval` drops the candidate into your **real installed roster** and measures both
 directions:
 
-- **hijack rate** — candidate fires on queries that belong to other skills
-- **shadow rate** — candidate loses its own queries to incumbents
+- **shadow rate** — candidate loses its own queries to incumbents. Am I redundant?
+- **hijack rate** — candidate fires on queries belonging to *any* other skill. Do I
+  pollute the roster?
+- **worst victim rate** — the single worst-hit skill's queries taken by the candidate.
+  Do I destroy anyone?
+
+That third one is the gate that matters, because `hijack_rate` divides by every other
+skill's queries and so **fades as the roster grows** — backwards for a tool whose whole
+claim is that big rosters are where collisions happen. A skill taking 100% of one victim's
+triggers scores 0.167 against a 7-skill roster and 0.022 against a 47-skill one, sailing
+through the gate exactly where it should be caught. `worst_victim_rate` is roster-size
+invariant, and it names the victim.
 
 It collapses the security axis into the same mechanic for free. Description injection
 isn't "regex hit on a suspicious phrase" — it's a *measured* hijack rate. A skill whose
@@ -47,7 +57,7 @@ Requires Python 3.9+. No network calls, no LLM calls, nothing to configure.
 ```
 skilleval lint <skill>      structural checks (frontmatter, name/dir match, length)
 skilleval scan <skill>      injection / overbroad-trigger pattern scan, exit-gates
-skilleval contend <skill>   hijack rate + shadow rate against the real roster
+skilleval contend <skill>   shadow / hijack / worst-victim rates vs the real roster
 skilleval roster            roster-wide shadow-rate matrix — catches install regressions
 skilleval judge <skill>     prints delegation instructions for an LLM rubric pass
 skilleval all <skill>       lint -> scan -> contend -> judge, gates on fail
@@ -73,6 +83,20 @@ top collisions (victim -> thief : count):
 
 `godot-scene-builder` loses 4 of its 7 own trigger queries to `godot-scene-doctor`. That
 collision was live in a real roster and invisible to every other tool.
+
+Same collision seen from the thief's side, which is what you get when vetting a candidate
+before install:
+
+```sh
+$ skilleval contend godot-scene-doctor
+{
+  "shadow_rate": 0.0,
+  "hijack_rate": 0.034,          # diluted across 47 skills — reads clean
+  "worst_victim": "godot-scene-builder",
+  "worst_victim_rate": 0.571,    # it eats 57% of one skill's triggers
+  "gate": "fail"
+}
+```
 
 ## Roster
 
@@ -102,6 +126,10 @@ right rather than noise to swallow:
 Query sets are generated from each skill's own description (`Use when:` / `Triggers on:`
 clauses, with a sentence fallback) and scored by TF-IDF cosine over the roster corpus. No
 live router, no model, so results are deterministic and diffable.
+
+Negative clauses are excluded — `NOT for:`, `Do NOT use when:`, `SKIP only when:` and
+friends. A skill saying "don't use me for video" must not be scored as though it should
+win video queries.
 
 Hand-written sets beat generated ones. Supply them with `--queries`:
 
@@ -133,9 +161,22 @@ the evaluation text aren't the same string. TF-IDF is also a lexical proxy for a
 model router: it catches vocabulary overlap, not semantic overlap. Two skills that collide
 in meaning while sharing no words will read clean here.
 
+Both `shadow_rate` and `hijack_rate` are fractions of *routable* queries. A skill that
+yields no routable queries at all is reported **unscorable** and exits 2 — it is not
+reported clean. Same for a candidate with no incumbents to contend against: no data is not
+evidence of safety.
+
 ## Gates
 
-`contend` and `all` exit non-zero when `shadow_rate > 0.3` or `hijack_rate > 0.15`.
+`contend` and `all` exit non-zero when any of these trip:
+
+| metric | gate | catches |
+|---|---|---|
+| `shadow_rate` | > 0.3 | the candidate is redundant against what's installed |
+| `hijack_rate` | > 0.15 | the candidate pollutes the whole roster |
+| `worst_victim_rate` | > 0.3 | the candidate destroys one specific skill |
+
+Exit codes are a contract: **0** clean, **1** a gate failed, **2** could not be scored.
 
 ## Tests
 

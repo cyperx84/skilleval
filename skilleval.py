@@ -16,6 +16,14 @@ Pipeline: lint -> scan -> contend -> judge
 
 No network calls, no LLM calls, stdlib only. Deterministic in, deterministic out.
 
+Contention metrics, all fractions of *routable* queries:
+  shadow_rate       my queries won by someone else — am I redundant?
+  hijack_rate       all other skills' queries won by me — do I pollute the roster?
+  worst_victim_rate the single worst-hit skill's queries won by me — do I destroy
+                    anyone? hijack_rate divides by the whole roster, so it fades
+                    as the roster grows; this one does not. It is the gate that
+                    matters when vetting one candidate against many incumbents.
+
 Metric honesty: queries are generated from each skill's own description and
 routed against vectors built from those same descriptions, so every skill has
 home-field advantage on its own queries. That biases shadow_rate LOW. A shadow
@@ -67,10 +75,25 @@ QUERY_MARKER_RE = re.compile(
     r"(?:triggers?\s+on|use\s+(?:this\s+skill\s+)?when|also\s+use\s+when|examples?)\s*:",
     re.IGNORECASE,
 )
-NEGATIVE_CLAUSE_RE = re.compile(r"NOT\s+for:|Do\s+NOT|SKIP\s+only|SKIP\b", re.IGNORECASE)
+# Ends the fragment harvested from a positive marker. Must cover every phrasing
+# NEGATED_MARKER_RE knows: skipping a negated marker is not enough on its own,
+# because the *previous* positive marker's fragment runs on into the negation.
+NEGATIVE_CLAUSE_RE = re.compile(
+    r"NOT\s+for:|Do\s+NOT|Never\s+use\b|Don'?t\s+use\b|SKIP\s+only|SKIP\b", re.IGNORECASE
+)
+# "Do NOT use when: X" contains a positive marker. Harvesting it would score the
+# skill as if it should win the queries it explicitly disclaims.
+NEGATED_MARKER_RE = re.compile(r"\b(?:not|never|don'?t|avoid|skip|except)\b[\s\w'-]{0,12}$", re.IGNORECASE)
 
 SHADOW_GATE = 0.3
 HIJACK_GATE = 0.15
+# Per-victim gate. hijack_rate divides by *every* other skill's queries, so it
+# shrinks as the roster grows — a skill that steals 100% of one victim's
+# triggers scores 0.167 against a 7-skill roster and 0.022 against a 47-skill
+# one. Diluting the signal with roster size is backwards for a tool whose whole
+# claim is that big rosters are where collisions happen. This metric is the
+# worst single victim's loss, which no roster size can wash out.
+VICTIM_GATE = 0.3
 
 
 class SkillError(Exception):
@@ -89,13 +112,38 @@ def tokenize(text):
     return [w for w in words if w not in STOPWORDS and len(w) > 1]
 
 
+def _find_close_quote(s, q):
+    """Index of the closing quote, honouring YAML escaping ('' in single, \\" in double)."""
+    i = 1
+    while i < len(s):
+        if s[i] == q:
+            if q == "'" and s[i + 1:i + 2] == "'":
+                i += 2
+                continue
+            if q == '"' and s[i - 1] == "\\":
+                i += 1
+                continue
+            return i
+        i += 1
+    return -1
+
+
 def _unquote(val):
+    """Unwrap a quoted scalar, or strip the trailing comment from a plain one.
+
+    ` #` opens a comment in a plain YAML scalar, so `name: cmt # note` is the
+    name `cmt`. Keeping the comment produced a roster key nothing could match.
+    Inside quotes a `#` is literal, so quoted scalars are unwrapped first.
+    """
     val = val.strip()
-    for pat in (r'^"(.*)"$', r"^'(.*)'$"):
-        m = re.match(pat, val, flags=re.DOTALL)
-        if m:
-            return m.group(1).strip()
-    return val
+    q = val[:1]
+    if q in ('"', "'"):
+        end = _find_close_quote(val, q)
+        if end != -1:
+            body = val[1:end]
+            return (body.replace("''", "'") if q == "'" else body.replace('\\"', '"')).strip()
+        return val
+    return re.sub(r"(?:(?<=\s)|^)#[^\n]*", "", val).strip()
 
 
 def _dedent(block):
@@ -168,7 +216,11 @@ def load_skill_file(path_str):
         if key in data and not isinstance(data[key], str):
             raise SkillError(f"{p}: frontmatter '{key}' must be a string, got {type(data[key]).__name__}")
     return {
-        "name": data.get("name", p.parent.name),
+        # Routing needs *some* key, so an absent name falls back to the directory.
+        # `declared_name` keeps the distinction lint depends on: with only `name`,
+        # a skill missing the field entirely looked identical to a correct one.
+        "name": data.get("name") or p.parent.name,
+        "declared_name": data.get("name") or "",
         "desc": data.get("description", ""),
         "path": str(p),
         "real_path": str(_resolve(p)),
@@ -290,6 +342,8 @@ def build_router(skills):
 def generate_queries(desc, max_q=8):
     queries = []
     for m in QUERY_MARKER_RE.finditer(desc):
+        if NEGATED_MARKER_RE.search(desc[max(0, m.start() - 24):m.start()]):
+            continue
         frag = desc[m.end():]
         frag = NEGATIVE_CLAUSE_RE.split(frag)[0]
         # Newlines are clause boundaries too — literal block scalars ('|') keep
@@ -301,6 +355,8 @@ def generate_queries(desc, max_q=8):
     if not queries:
         for s in re.split(r"(?<=[.!?])\s+", desc):
             s = s.strip()
+            if NEGATIVE_CLAUSE_RE.search(s):
+                continue
             if 3 <= len(s.split()) <= 20:
                 queries.append(s)
     out = []
@@ -313,13 +369,31 @@ def generate_queries(desc, max_q=8):
     return out[:max_q]
 
 
-def load_query_overrides(path):
-    """{"skill-name": ["query", ...]} — hand-written sets beat generated ones."""
+def load_query_overrides(path, known=None):
+    """{"skill-name": ["query", ...]} — hand-written sets beat generated ones.
+
+    Validated up front: a bare string silently became a set of character-queries,
+    and a typo'd skill name silently applied to nothing, so an override file that
+    did nothing at all looked exactly like one that worked.
+    """
     if not path:
         return {}
-    data = json.loads(Path(path).expanduser().read_text())
+    p = Path(path).expanduser()
+    try:
+        data = json.loads(p.read_text())
+    except OSError as e:
+        raise SkillError(f"{path}: cannot read query file: {e}")
+    except json.JSONDecodeError as e:
+        raise SkillError(f"{path}: invalid JSON: {e}")
     if not isinstance(data, dict):
         raise SkillError(f"{path}: expected a JSON object mapping skill name -> [queries]")
+    for name, qs in data.items():
+        if not isinstance(qs, list) or not all(isinstance(q, str) and q.strip() for q in qs):
+            raise SkillError(f"{path}: '{name}' must be a list of non-empty strings, got {qs!r}")
+    if known is not None:
+        for name in sorted(set(data) - set(known)):
+            print(f"warning: --queries entry '{name}' matches no skill in the roster (ignored)",
+                  file=sys.stderr)
     return data
 
 
@@ -359,10 +433,11 @@ def resolve_target(skill_arg, skills):
 
 def check_lint(sk):
     findings = []
-    if not sk["name"]:
+    declared = sk.get("declared_name", "")
+    if not declared:
         findings.append(("fail", "missing name in frontmatter"))
-    elif sk["name"] != sk["dir_name"]:
-        findings.append(("warn", f"name '{sk['name']}' != directory '{sk['dir_name']}'"))
+    elif declared != sk["dir_name"]:
+        findings.append(("warn", f"name '{declared}' != directory '{sk['dir_name']}'"))
     if not sk["desc"]:
         findings.append(("fail", "missing description in frontmatter"))
     else:
@@ -422,7 +497,8 @@ def check_contend(target, skills, overrides=None):
         )
     shadow_rate = len(shadow_hits) / own_scored
 
-    hijack_hits, other_scored, other_unroutable = [], 0, 0
+    hijack_hits, other_unroutable = [], 0
+    victim_totals, victim_stolen = Counter(), Counter()
     for name, qs in query_sets.items():
         if name == target:
             continue
@@ -431,10 +507,23 @@ def check_contend(target, skills, overrides=None):
             if not ranked:
                 other_unroutable += 1
                 continue
-            other_scored += 1
+            victim_totals[name] += 1
             if ranked[0][1] == target:
+                victim_stolen[name] += 1
                 hijack_hits.append({"query": q, "victim": name, "score": round(ranked[0][0], 3)})
-    hijack_rate = len(hijack_hits) / other_scored if other_scored else 0.0
+    other_scored = sum(victim_totals.values())
+    if other_scored == 0:
+        raise SkillError(
+            f"'{target}': no incumbent had a routable query to contend for "
+            f"(roster of {len(skills)}) — unscorable, not clean. A skill cannot be "
+            "shown safe against a roster it was never measured against."
+        )
+    hijack_rate = round(len(hijack_hits) / other_scored, 3)
+
+    victim_rates = {v: round(victim_stolen[v] / victim_totals[v], 3) for v in sorted(victim_stolen)}
+    worst_victim, worst_victim_rate = "", 0.0
+    if victim_rates:
+        worst_victim, worst_victim_rate = sorted(victim_rates.items(), key=lambda kv: (-kv[1], kv[0]))[0]
 
     return {
         "target": target,
@@ -445,9 +534,14 @@ def check_contend(target, skills, overrides=None):
         "shadow_hits": shadow_hits,
         "other_query_count": other_scored,
         "other_unroutable": other_unroutable,
-        "hijack_rate": round(hijack_rate, 3),
-        "hijack_hits": sorted(hijack_hits, key=lambda h: -h["score"]),
-        "gate": "fail" if (shadow_rate > SHADOW_GATE or hijack_rate > HIJACK_GATE) else "pass",
+        "hijack_rate": hijack_rate,
+        "worst_victim": worst_victim,
+        "worst_victim_rate": worst_victim_rate,
+        "victim_rates": victim_rates,
+        "hijack_hits": sorted(hijack_hits, key=lambda h: (-h["score"], h["victim"], h["query"])),
+        "gate": "fail" if (round(shadow_rate, 3) > SHADOW_GATE
+                           or hijack_rate > HIJACK_GATE
+                           or worst_victim_rate > VICTIM_GATE) else "pass",
     }
 
 
@@ -475,7 +569,7 @@ def cmd_contend(args):
     target, notes = resolve_target(args.skill, skills)
     if not target:
         raise SkillError(f"skill not found: {args.skill}")
-    result = check_contend(target, skills, load_query_overrides(args.queries))
+    result = check_contend(target, skills, load_query_overrides(args.queries, skills))
     result["notes"] = notes
     print(json.dumps(result, indent=2))
     return 1 if result["gate"] == "fail" else 0
@@ -485,7 +579,7 @@ def cmd_roster(args):
     report = {}
     skills = discover_skills(strict=args.strict, report=report)
     route = build_router(skills)
-    query_sets = build_query_sets(skills, load_query_overrides(args.queries))
+    query_sets = build_query_sets(skills, load_query_overrides(args.queries, skills))
 
     matrix, summary, unscorable = {}, {}, []
     for name, qs in query_sets.items():
@@ -584,18 +678,21 @@ def cmd_all(args):
         return 1
 
     print(f"\n=== contend: {target} vs roster of {len(skills)} ===")
-    contend_result = check_contend(target, skills, load_query_overrides(args.queries))
+    contend_result = check_contend(target, skills, load_query_overrides(args.queries, skills))
     print(json.dumps(contend_result, indent=2))
 
     print(f"\n=== judge: {target} ===")
     print(f'delegate: "use skill-eval skill to score {target}"')
 
+    worst = f" ({contend_result['worst_victim']})" if contend_result["worst_victim"] else ""
     print("\n=== summary ===")
     print(f"lint: {lint_result['gate']}  scan: {scan_result['gate']}  "
           f"shadow_rate: {contend_result['shadow_rate']:.2f}  "
-          f"hijack_rate: {contend_result['hijack_rate']:.2f}")
+          f"hijack_rate: {contend_result['hijack_rate']:.2f}  "
+          f"worst_victim_rate: {contend_result['worst_victim_rate']:.2f}{worst}")
     if contend_result["gate"] == "fail":
-        print(f"contention gate: FAIL (shadow>{SHADOW_GATE} or hijack>{HIJACK_GATE})")
+        print(f"contention gate: FAIL (shadow>{SHADOW_GATE}, hijack>{HIJACK_GATE}, "
+              f"or worst_victim>{VICTIM_GATE})")
         return 1
     print("contention gate: pass")
     return 0
@@ -603,7 +700,7 @@ def cmd_all(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="skilleval", description="Contention eval for AgentSkills.")
-    ap.add_argument("--version", action="version", version="skilleval 0.1.0")
+    ap.add_argument("--version", action="version", version="skilleval 0.2.0")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add_roster_opts(p):
@@ -640,9 +737,16 @@ def main():
     p_all.set_defaults(func=cmd_all)
 
     args = ap.parse_args()
+    # Exit codes are a contract: 0 clean, 1 a gate failed, 2 could not be scored.
+    # An unhandled OSError exiting 1 would read as "gate failed" to any caller.
     try:
         sys.exit(args.func(args))
+    except BrokenPipeError:
+        os._exit(0)  # `skilleval roster | head` — not an error
     except SkillError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
+    except (OSError, json.JSONDecodeError) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(2)
 
