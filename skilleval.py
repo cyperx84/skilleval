@@ -71,8 +71,31 @@ INJECTION_PATTERNS = [
 ]
 
 # Query-extraction markers, matched case-insensitively.
+#
+# The colon is optional for every marker but "example", because real skills
+# overwhelmingly write the trigger clause as prose: "Use this skill whenever the
+# user wants to search the web, find articles, ...". Requiring the colon missed
+# 37 of 47 skills on a real roster, dropping them to the sentence fallback,
+# which caps at 20 words and so harvested *one* query from a 734-char
+# description. That starvation is what makes a per-victim rate swing on a single
+# query, so it is fixed at the source rather than by tuning the gate.
+# "example" keeps its colon: unanchored, the bare word matches in open prose.
+#
+# The optional "the user wants to" tail is consumed, not matched, so the
+# harvested fragment starts at the verb ("search the web") rather than carrying
+# a subject clause that is identical across every skill and would dominate the
+# TF-IDF vector with noise common to the whole roster.
 QUERY_MARKER_RE = re.compile(
-    r"(?:triggers?\s+on|use\s+(?:this\s+skill\s+)?when|also\s+use\s+when|examples?)\s*:",
+    r"(?:"
+    # '(?:\s*:)?' not '\s*:?': the latter's \s* eats the space before "the user"
+    # even when no colon follows, so the tail below can never match its \s+.
+    r"(?:triggers?\s+on|activates?\s+on|also\s+use\s+when"
+    r"|use\s+(?:this\s+skill\s+)?when(?:ever)?)(?:\s*:)?"
+    r"|examples?\s*:"
+    r")"
+    r"(?:\s+(?:a|the)\s+user\s+"
+    r"(?:wants\s+to|asks\s+to|asks|says|provides|needs\s+to|needs|mentions)"
+    r")?",
     re.IGNORECASE,
 )
 # Ends the fragment harvested from a positive marker. Must cover every phrasing
@@ -94,6 +117,14 @@ HIJACK_GATE = 0.15
 # claim is that big rosters are where collisions happen. This metric is the
 # worst single victim's loss, which no roster size can wash out.
 VICTIM_GATE = 0.3
+# A rate over a handful of queries cannot be gated on: at 3 queries the smallest
+# non-zero worst_victim_rate is 0.333, which clears VICTIM_GATE on a *single*
+# stolen query, so the gate fires on quantisation noise rather than on evidence.
+# Below this many routable queries the rate is still reported — it is a lead —
+# but it does not decide the exit code. Fixing the query generator (see
+# QUERY_MARKER_RE) is what actually shrinks the set this applies to; the guard
+# is the floor for descriptions too terse to harvest either way.
+MIN_GATE_QUERIES = 5
 
 
 class SkillError(Exception):
@@ -108,8 +139,18 @@ def roster_dirs():
 
 
 def tokenize(text):
+    """Stemmed, so a trigger matches its own morphology.
+
+    Descriptions and queries disagree on surface form constantly — a skill says
+    "Use when building scenes" and lists "Triggers on: build scene". Unstemmed,
+    'building' and 'build' are unrelated tokens, so a skill scores *poorly on its
+    own trigger* and a sibling sharing the noun wins it. That is a tokenisation
+    artifact reported as a collision, and the real router (an LLM) has no such
+    blind spot. Stemming here also makes this the single definition of "same
+    words" for both routing and query dedup.
+    """
     words = re.findall(r"[a-z0-9]+", text.lower())
-    return [w for w in words if w not in STOPWORDS and len(w) > 1]
+    return [_stem(w) for w in words if w not in STOPWORDS and len(w) > 1]
 
 
 def _find_close_quote(s, q):
@@ -339,12 +380,52 @@ def build_router(skills):
     return route
 
 
+def _stem(w):
+    """Crude suffix-stripper, enough to make 'building scenes' == 'build scene'.
+
+    Not linguistics: the only job is collapsing the gerund/plural pair that one
+    description states both ways ("Use when building scenes... Triggers on: build
+    scene"). Over-collapsing two genuinely different triggers costs one query;
+    under-collapsing double-counts one trigger in the denominator of every rate.
+
+    Order matters and is load-bearing: the plural must come off before the
+    gerund. Stripping '-ing' first makes 'settings' -> 'setting' (the '-ing'
+    branch never fires, the word ends in 's') while bare 'setting' -> 'sett',
+    so a word and its own plural stem apart — the exact collision this is meant
+    to catch, inverted.
+    """
+    w = w.lower()
+    if w.endswith("es") and len(w) > 3:
+        w = w[:-2]
+    elif w.endswith("s") and len(w) > 3:
+        w = w[:-1]
+    if w.endswith("ing") and len(w) > 5:
+        w = w[:-3]
+    elif w.endswith("ed") and len(w) > 4:
+        w = w[:-2]
+    if w.endswith("e") and len(w) > 3:
+        w = w[:-1]
+    return w
+
+
+def _dedup_key(q):
+    return " ".join(_stem(w) for w in re.findall(r"[\w'-]+", q.lower()))
+
+
 def generate_queries(desc, max_q=8):
     queries = []
-    for m in QUERY_MARKER_RE.finditer(desc):
+    # A marker's fragment ends at the next marker, not at the end of the string.
+    # Descriptions chain clauses ("Use when building scenes... Triggers on: build
+    # scene"), and an unbounded fragment swallows the following marker's literal
+    # text into a query. The next marker's own fragment is harvested on its own
+    # iteration, so nothing is lost by stopping here. Negated markers still bound
+    # the fragment even though they are not harvested themselves.
+    marks = list(QUERY_MARKER_RE.finditer(desc))
+    for i, m in enumerate(marks):
         if NEGATED_MARKER_RE.search(desc[max(0, m.start() - 24):m.start()]):
             continue
-        frag = desc[m.end():]
+        stop = marks[i + 1].start() if i + 1 < len(marks) else len(desc)
+        frag = desc[m.end():stop]
         frag = NEGATIVE_CLAUSE_RE.split(frag)[0]
         # Newlines are clause boundaries too — literal block scalars ('|') keep
         # them, and without this a whole block collapses into one junk query.
@@ -360,11 +441,11 @@ def generate_queries(desc, max_q=8):
             if 3 <= len(s.split()) <= 20:
                 queries.append(s)
     out = []
-    seen_lower = set()
+    seen = set()
     for q in queries:
-        low = q.lower()
-        if low not in seen_lower:
-            seen_lower.add(low)
+        key = _dedup_key(q)
+        if key not in seen:
+            seen.add(key)
             out.append(q)
     return out[:max_q]
 
@@ -471,7 +552,14 @@ def check_scan(sk):
 
 def check_contend(target, skills, overrides=None):
     route = build_router(skills)
-    query_sets = build_query_sets(skills, overrides or {})
+    overrides = overrides or {}
+    query_sets = build_query_sets(skills, overrides)
+    # MIN_GATE_QUERIES guards against a *generated* query set being too thin to
+    # trust — it is a proxy for the trigger surface, and a terse description
+    # starves it. A hand-written override is not a proxy: it is the author
+    # stating "these are the queries this skill must win". One of those losing is
+    # evidence, not noise, so overridden sets are gated however small they are.
+    exempt = {n for n, qs in overrides.items() if qs and n in query_sets}
 
     own = query_sets[target]
     if not own:
@@ -525,6 +613,50 @@ def check_contend(target, skills, overrides=None):
     if victim_rates:
         worst_victim, worst_victim_rate = sorted(victim_rates.items(), key=lambda kv: (-kv[1], kv[0]))[0]
 
+    # Gate only on rates with enough queries under them to mean anything. The
+    # rates above stay in the report either way — suppressing the gate is not the
+    # same as calling the skill clean, so anything suppressed is named in
+    # 'advisory' rather than dropped.
+    advisory = []
+    shadow_gateable = own_scored >= MIN_GATE_QUERIES or target in exempt
+    if not shadow_gateable:
+        advisory.append(
+            f"shadow_rate {round(shadow_rate, 3)} reported but not gated: '{target}' has "
+            f"{own_scored} routable quer{'y' if own_scored == 1 else 'ies'} "
+            f"(need {MIN_GATE_QUERIES}). Widen its description or supply --queries."
+        )
+    # hijack_rate needs the same floor. Its denominator is every other skill's
+    # queries, so it only goes thin on a small roster — but there it gates on one
+    # or two queries, which is the quantisation noise this guard exists to stop.
+    hijack_gateable = other_scored >= MIN_GATE_QUERIES or bool(exempt - {target})
+    if not hijack_gateable:
+        advisory.append(
+            f"hijack_rate {hijack_rate} reported but not gated: the roster offered only "
+            f"{other_scored} routable quer{'y' if other_scored == 1 else 'ies'} to contend "
+            f"for (need {MIN_GATE_QUERIES})."
+        )
+    gateable_victims = {
+        v: r for v, r in victim_rates.items()
+        if victim_totals[v] >= MIN_GATE_QUERIES or v in exempt
+    }
+    worst_gated_victim, worst_gated_rate = "", 0.0
+    if gateable_victims:
+        worst_gated_victim, worst_gated_rate = sorted(
+            gateable_victims.items(), key=lambda kv: (-kv[1], kv[0])
+        )[0]
+    if worst_victim and worst_victim not in gateable_victims:
+        advisory.append(
+            f"worst_victim_rate {worst_victim_rate} ('{worst_victim}') reported but not gated: "
+            f"that victim has only {victim_totals[worst_victim]} routable "
+            f"quer{'y' if victim_totals[worst_victim] == 1 else 'ies'} (need {MIN_GATE_QUERIES})."
+        )
+    if not shadow_gateable and not hijack_gateable and not gateable_victims:
+        raise SkillError(
+            f"'{target}': no rate had at least {MIN_GATE_QUERIES} routable queries behind it "
+            f"(own: {own_scored}, roster: {other_scored}, best victim: "
+            f"{max(victim_totals.values(), default=0)}) — unscorable, not clean."
+        )
+
     return {
         "target": target,
         "roster_size": len(skills),
@@ -538,10 +670,15 @@ def check_contend(target, skills, overrides=None):
         "worst_victim": worst_victim,
         "worst_victim_rate": worst_victim_rate,
         "victim_rates": victim_rates,
+        "min_gate_queries": MIN_GATE_QUERIES,
+        "gated_victims": sorted(gateable_victims),
+        "worst_gated_victim": worst_gated_victim,
+        "worst_gated_victim_rate": worst_gated_rate,
+        "advisory": advisory,
         "hijack_hits": sorted(hijack_hits, key=lambda h: (-h["score"], h["victim"], h["query"])),
-        "gate": "fail" if (round(shadow_rate, 3) > SHADOW_GATE
-                           or hijack_rate > HIJACK_GATE
-                           or worst_victim_rate > VICTIM_GATE) else "pass",
+        "gate": "fail" if ((shadow_gateable and round(shadow_rate, 3) > SHADOW_GATE)
+                           or (hijack_gateable and hijack_rate > HIJACK_GATE)
+                           or worst_gated_rate > VICTIM_GATE) else "pass",
     }
 
 
@@ -700,7 +837,7 @@ def cmd_all(args):
 
 def main():
     ap = argparse.ArgumentParser(prog="skilleval", description="Contention eval for AgentSkills.")
-    ap.add_argument("--version", action="version", version="skilleval 0.2.0")
+    ap.add_argument("--version", action="version", version="skilleval 0.3.0")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add_roster_opts(p):

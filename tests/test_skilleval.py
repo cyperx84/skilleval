@@ -24,6 +24,32 @@ se = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(se)
 
 
+# Rosters here must clear MIN_GATE_QUERIES to exercise gating at all: a skill
+# with two triggers is the starved case the guard deliberately refuses to gate,
+# so a two-query fixture tests the guard, not the metric under it. These are
+# sized like real skills — the shared ones below carry no vocabulary in common,
+# so nothing routes across them by accident.
+ALPHA_DESC = ("Use when: scraping a webpage, fetching a URL, crawling a docs site, "
+              "extracting page markdown, downloading site content")
+# Deliberately unrelated to each other: a victim whose description spans several
+# concerns has a diluted vector, which is what lets a tightly-scoped impostor
+# outscore it on any single one of them.
+VICTIM_TRIGGERS = ("encoding a FLAC audio file, pruning rose bushes, filing quarterly "
+                   "tax returns, debugging kernel panics, calibrating a barometer")
+# One trigger buried under unrelated prose: the vector is diluted but the query
+# set is thin, which is the case the MIN_GATE_QUERIES guard is about. The
+# impostor's triggers are near-duplicates, so its vector stays concentrated on
+# exactly that one topic and takes the query outright.
+THIN_VICTIM_DESC = ("Handles administrative chores, scheduling logistics, inventory "
+                    "reconciliation, departmental planning workshops, payroll reviews, "
+                    "and vendor onboarding paperwork. Use when: encoding a FLAC audio file")
+FLAC_IMPOSTOR_DESC = ("Use when: encoding a FLAC audio file, encoding FLAC audio, "
+                      "FLAC audio encoding, encode audio into FLAC, "
+                      "FLAC encoding for an audio file")
+BETA_DESC = ("Use when: rendering a video, encoding audio, trimming a clip, "
+             "muxing subtitle tracks, exporting a timeline")
+
+
 def write_skill(root, name, description, body="body text\n", fm_name=None):
     d = Path(root) / name
     d.mkdir(parents=True, exist_ok=True)
@@ -57,9 +83,19 @@ class TestRouting(RosterTestCase):
         self.assertTrue(ranked, "an in-vocabulary query must route")
         self.assertGreater(ranked[0][0], 0.0, "a winner must have a positive score")
 
+    def test_regression_router_matches_trigger_across_morphology(self):
+        """Unstemmed, a skill scored poorly on its *own* trigger when its prose
+        used a different form, handing the query to a sibling sharing the noun —
+        a tokenisation artifact reported as a collision."""
+        write_skill(self.roster, "builder", "Use when building scenes, adding nodes to a scene")
+        write_skill(self.roster, "doctor", "Use when: auditing scene health, scene lint checks")
+        route = se.build_router(se.discover_skills())
+        self.assertEqual(route("build scene")[0][1], "builder",
+                         "a skill must win its own trigger stated in another form")
+
     def test_own_description_query_routes_to_itself_when_uncontested(self):
-        write_skill(self.roster, "alpha", "Use when: scraping a webpage, fetching a URL")
-        write_skill(self.roster, "beta", "Use when: rendering a video, encoding audio")
+        write_skill(self.roster, "alpha", ALPHA_DESC)
+        write_skill(self.roster, "beta", BETA_DESC)
         result = se.check_contend("alpha", se.discover_skills())
         self.assertEqual(result["shadow_rate"], 0.0)
         self.assertEqual(result["gate"], "pass")
@@ -101,18 +137,17 @@ class TestContend(RosterTestCase):
         description *is* one query cannot be hijacked on it — it scores 1.0
         against itself. That home-field advantage is why shadow_rate reads low.
         """
-        write_skill(self.roster, "victim",
-                    "Use when: encoding a FLAC audio file, pruning rose bushes, "
-                    "filing quarterly tax returns, debugging kernel panics")
+        write_skill(self.roster, "victim", f"Use when: {VICTIM_TRIGGERS}")
         write_skill(self.roster, "impostor", "Use when: encoding a FLAC audio file")
         result = se.check_contend("impostor", se.discover_skills())
         self.assertGreater(result["hijack_rate"], 0.0)
         self.assertTrue(any(h["victim"] == "victim" for h in result["hijack_hits"]))
 
     def test_rates_are_bounded_fractions(self):
-        write_skill(self.roster, "alpha", "Use when: scraping a webpage, fetching a URL")
-        write_skill(self.roster, "beta", "Use when: rendering a video, encoding audio")
-        write_skill(self.roster, "gamma", "Use when: scraping a webpage, crawling a site")
+        write_skill(self.roster, "alpha", ALPHA_DESC)
+        write_skill(self.roster, "beta", BETA_DESC)
+        write_skill(self.roster, "gamma", "Use when: scraping a webpage, crawling a site, "
+                                          "fetching a URL, mirroring a domain, saving pages")
         r = se.check_contend("alpha", se.discover_skills())
         for key in ("shadow_rate", "hijack_rate"):
             self.assertGreaterEqual(r[key], 0.0)
@@ -133,11 +168,8 @@ class TestContend(RosterTestCase):
         write_skill(self.roster, "victim",
                     "Handles administrative chores, scheduling logistics, inventory "
                     "reconciliation, and departmental planning workshops. "
-                    "Use when: encoding a FLAC audio file, pruning rose bushes, "
-                    "filing tax returns, debugging kernel panics")
-        write_skill(self.roster, "impostor",
-                    "Use when: encoding a FLAC audio file, pruning rose bushes, "
-                    "filing tax returns, debugging kernel panics")
+                    f"Use when: {VICTIM_TRIGGERS}")
+        write_skill(self.roster, "impostor", f"Use when: {VICTIM_TRIGGERS}")
         small = se.check_contend("impostor", se.discover_skills())
 
         for i in range(40):
@@ -162,15 +194,54 @@ class TestContend(RosterTestCase):
         self.assertIn("unscorable", str(ctx.exception))
 
     def test_victim_rates_are_reported_per_skill(self):
-        write_skill(self.roster, "victim",
-                    "Use when: encoding a FLAC audio file, pruning rose bushes, "
-                    "filing quarterly tax returns, debugging kernel panics")
+        write_skill(self.roster, "victim", f"Use when: {VICTIM_TRIGGERS}")
         write_skill(self.roster, "bystander", "Use when: forecasting tomorrow's weather")
         write_skill(self.roster, "impostor", "Use when: encoding a FLAC audio file")
         r = se.check_contend("impostor", se.discover_skills())
         self.assertIn("victim", r["victim_rates"])
         self.assertNotIn("bystander", r["victim_rates"], "untouched skills are not listed as victims")
         self.assertLessEqual(r["worst_victim_rate"], 1.0)
+
+    def test_regression_thin_victim_rate_is_reported_but_not_gated(self):
+        """A rate over a handful of queries cannot decide an exit code.
+
+        At 3 queries the smallest non-zero worst_victim_rate is 0.333, clearing
+        VICTIM_GATE on a single stolen query — the gate fires on quantisation
+        noise. The rate must still be reported: not gating is not a clean bill.
+        """
+        write_skill(self.roster, "victim", THIN_VICTIM_DESC)
+        write_skill(self.roster, "impostor", FLAC_IMPOSTOR_DESC)
+        r = se.check_contend("impostor", se.discover_skills())
+
+        self.assertEqual(r["worst_victim"], "victim")
+        self.assertEqual(r["worst_victim_rate"], 1.0, "the raw rate is still reported in full")
+        self.assertNotIn("victim", r["gated_victims"])
+        self.assertEqual(r["worst_gated_victim_rate"], 0.0)
+        self.assertEqual(r["gate"], "pass")
+        self.assertTrue(any("not gated" in a for a in r["advisory"]),
+                        "a suppressed rate must be named, not silently dropped")
+
+    def test_regression_thin_override_is_gated_anyway(self):
+        """MIN_GATE_QUERIES guards a *generated* set, which is a proxy a terse
+        description starves. A hand-written set is the author stating what the
+        skill must win — one of those losing is evidence, not noise."""
+        write_skill(self.roster, "victim", THIN_VICTIM_DESC)
+        write_skill(self.roster, "impostor", FLAC_IMPOSTOR_DESC)
+        overrides = {"victim": ["encoding a FLAC audio file"]}
+        r = se.check_contend("impostor", se.discover_skills(), overrides)
+
+        self.assertIn("victim", r["gated_victims"])
+        self.assertEqual(r["worst_gated_victim_rate"], 1.0)
+        self.assertEqual(r["gate"], "fail")
+
+    def test_regression_wholly_ungateable_roster_is_unscorable_not_clean(self):
+        """Every rate too thin to gate means no verdict was reached. Reporting
+        that as a pass is the no-data-as-safety bug in a new place."""
+        write_skill(self.roster, "alpha", "Use when: scraping a webpage")
+        write_skill(self.roster, "beta", "Use when: rendering a video")
+        with self.assertRaises(se.SkillError) as ctx:
+            se.check_contend("alpha", se.discover_skills())
+        self.assertIn("unscorable", str(ctx.exception))
 
     def test_query_overrides_replace_generated_set(self):
         write_skill(self.roster, "alpha", "Use when: scraping a webpage")
@@ -198,6 +269,77 @@ class TestQueryGeneration(unittest.TestCase):
     def test_triggers_on_marker_is_extracted(self):
         qs = se.generate_queries("Triggers on: 'scrape this page', 'fetch that URL'")
         self.assertTrue(any("scrape this page" in q for q in qs))
+
+    def test_regression_prose_trigger_clause_without_colon_is_harvested(self):
+        """The dominant real-world phrasing carries no colon.
+
+        Requiring one missed 37 of 47 skills on a real roster: they fell through
+        to the sentence fallback, whose 20-word cap harvested a single query from
+        a 734-char description. That starvation is what made a per-victim rate
+        swing on one query, so it is fixed at the generator, not at the gate.
+        """
+        qs = se.generate_queries(
+            "Use this skill whenever the user wants to search the web, find articles, "
+            "research a topic, look something up online"
+        )
+        self.assertIn("search the web", qs)
+        self.assertIn("find articles", qs)
+        self.assertGreaterEqual(len(qs), 4)
+
+    def test_regression_subject_lead_in_is_not_part_of_the_query(self):
+        """"the user wants to" must be consumed by the marker, not harvested.
+
+        It is identical across the roster, so leaving it in the query pollutes
+        every vector with vocabulary common to all skills.
+        """
+        for lead in ("the user wants to", "the user asks to", "a user wants to",
+                     "the user says", "the user provides"):
+            qs = se.generate_queries(f"Use when {lead} scrape a webpage, fetch a URL")
+            self.assertTrue(all(not q.startswith(("the user", "a user")) for q in qs), (lead, qs))
+            self.assertTrue(any("scrape a webpage" in q for q in qs), (lead, qs))
+
+    def test_regression_fragment_stops_at_the_next_marker(self):
+        """An unbounded fragment swallowed the following marker's literal text
+        into a query ('Triggers on: build scene'). The next marker is harvested
+        on its own iteration, so bounding loses nothing."""
+        qs = se.generate_queries(
+            "Use when building scenes, adding nodes. Triggers on: build scene, compose scene"
+        )
+        self.assertTrue(all("Triggers on" not in q for q in qs), qs)
+        self.assertIn("building scenes", qs)
+        # 'build scene' is the same trigger as 'building scenes' and dedups into
+        # it; 'compose scene' is unique to the second marker, so its presence is
+        # what proves that clause was harvested rather than swallowed.
+        self.assertIn("compose scene", qs)
+
+    def test_regression_gerund_and_base_trigger_dedup_to_one_query(self):
+        """One description states the same trigger twice ("Use when building
+        scenes... Triggers on: build scene"). Counting both double-counts it in
+        the denominator of every rate the tool reports."""
+        qs = se.generate_queries(
+            "Use when building scenes, adding nodes. Triggers on: build scene, add nodes"
+        )
+        self.assertEqual(len(qs), 2, qs)
+
+    def test_stem_is_stable_across_plural_and_gerund(self):
+        """A word and its own inflections must share a stem.
+
+        Stripping '-ing' before the plural silently breaks this for '-ings'
+        words, which stems a word apart from its own plural.
+        """
+        for a, b in [("settings", "setting"), ("scenes", "scene"), ("building", "build"),
+                     ("nodes", "node"), ("creating", "create"), ("creates", "create"),
+                     ("encoding", "encode"), ("populating", "populate")]:
+            self.assertEqual(se._stem(a), se._stem(b), f"{a} vs {b}")
+
+    def test_activates_on_marker_is_extracted(self):
+        qs = se.generate_queries("Activates on explicit /notebooklm, creating a podcast")
+        self.assertTrue(any("notebooklm" in q for q in qs), qs)
+
+    def test_bare_example_word_is_not_a_marker(self):
+        """'example' keeps its colon: unanchored it matches in open prose."""
+        qs = se.generate_queries("A worked example shows the parser handling nested input")
+        self.assertTrue(all("shows the parser" not in q or q.startswith("A worked") for q in qs), qs)
 
     def test_regression_negated_marker_is_not_harvested_as_positive(self):
         """'Do NOT use when: X' contains a positive marker. Harvesting it scored
@@ -440,8 +582,8 @@ class TestCliExitCodes(RosterTestCase):
         return proc.returncode, proc.stdout, proc.stderr
 
     def test_clean_skill_exits_zero(self):
-        write_skill(self.roster, "alpha", "Use when: scraping a webpage, fetching a URL")
-        write_skill(self.roster, "beta", "Use when: rendering a video, encoding audio")
+        write_skill(self.roster, "alpha", ALPHA_DESC)
+        write_skill(self.roster, "beta", BETA_DESC)
         code, _, err = self.run_cli("all", "alpha")
         self.assertEqual(code, 0, err)
 

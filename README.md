@@ -73,27 +73,32 @@ $ skilleval roster
 roster: 47 skills merged from ~/.agents/skills, ~/.openclaw/skills, ~/.claude/skills
 
 skill                            queries  shadow_rate
-godot-scene-builder                    7         0.57
+firecrawl                              8         0.88
 workers-best-practices                 2         0.50
+wrangler                               2         0.50
+firecrawl-scrape                       7         0.29
 
 top collisions (victim -> thief : count):
-  godot-scene-builder -> godot-scene-doctor : 4
+  firecrawl -> firecrawl-search : 3
+  firecrawl -> firecrawl-scrape : 2
   wrangler -> cloudflare : 1
+  workers-best-practices -> cloudflare : 1
 ```
 
-`godot-scene-builder` loses 4 of its 7 own trigger queries to `godot-scene-doctor`. That
-collision was live in a real roster and invisible to every other tool.
+The umbrella `firecrawl` skill loses **7 of its own 8 trigger queries** to the specialised
+siblings installed alongside it — `search the web` goes to `firecrawl-search`, `research a
+topic` to `deep-research`. It is installed, and it is nearly unreachable. That collision
+was live in a real roster and invisible to every other tool.
 
-Same collision seen from the thief's side, which is what you get when vetting a candidate
-before install:
+Seen from the candidate's side, which is what you get when vetting before install:
 
 ```sh
-$ skilleval contend godot-scene-doctor
+$ skilleval contend firecrawl
 {
-  "shadow_rate": 0.0,
-  "hijack_rate": 0.034,          # diluted across 47 skills — reads clean
-  "worst_victim": "godot-scene-builder",
-  "worst_victim_rate": 0.571,    # it eats 57% of one skill's triggers
+  "shadow_rate": 0.875,          # loses 7 of its own 8 triggers
+  "hijack_rate": 0.004,          # diluted across 47 skills — reads clean
+  "worst_victim": "firecrawl-scrape",
+  "worst_victim_rate": 0.143,
   "gate": "fail"
 }
 ```
@@ -123,9 +128,22 @@ right rather than noise to swallow:
 
 ## Queries
 
-Query sets are generated from each skill's own description (`Use when:` / `Triggers on:`
-clauses, with a sentence fallback) and scored by TF-IDF cosine over the roster corpus. No
-live router, no model, so results are deterministic and diffable.
+Query sets are generated from each skill's own description (`Use when` / `Triggers on` /
+`Activates on` clauses, with a sentence fallback) and scored by TF-IDF cosine over the
+roster corpus. No live router, no model, so results are deterministic and diffable.
+
+The colon is optional, because real descriptions state the trigger as prose — *"Use this
+skill whenever the user wants to search the web, find articles…"*. A subject lead-in
+(`the user wants to`, `the user asks to`) is consumed rather than harvested: it is
+identical across every skill, so leaving it in the query pollutes every vector with
+vocabulary common to the whole roster.
+
+Text is **stemmed** on both sides, so `build scene` and `building scenes` are one trigger.
+Unstemmed they are unrelated tokens, and a skill scores badly on *its own* trigger
+whenever its prose and its trigger list disagree on grammatical form — handing the query
+to whichever sibling merely repeats the shared noun more often. That is a tokenisation
+artifact, and the real router has no such blind spot. The same stem is what dedups a
+trigger a description states twice.
 
 Negative clauses are excluded — `NOT for:`, `Do NOT use when:`, `SKIP only when:` and
 friends. A skill saying "don't use me for video" must not be scored as though it should
@@ -161,6 +179,15 @@ the evaluation text aren't the same string. TF-IDF is also a lexical proxy for a
 model router: it catches vocabulary overlap, not semantic overlap. Two skills that collide
 in meaning while sharing no words will read clean here.
 
+The proxy cuts the other way too, and it has drawn blood. Because cosine weights term
+frequency, a skill that merely **repeats a shared noun** more often than its neighbour can
+appear to steal that neighbour's triggers without any semantic overlap at all. Before
+v0.3.0 this tool reported that `godot-scene-doctor` (a scene *health checker*) ate 57% of
+`godot-scene-builder`'s triggers — purely because "scene" appears more densely in the
+doctor's description, and unstemmed tokens stopped the builder from matching its own
+`build scene` trigger. Stemming removed that finding entirely. Read a hit as *"these
+descriptions compete lexically"*, and confirm it reads as a real collision before acting.
+
 Both `shadow_rate` and `hijack_rate` are fractions of *routable* queries. A skill that
 yields no routable queries at all is reported **unscorable** and exits 2 — it is not
 reported clean. Same for a candidate with no incumbents to contend against: no data is not
@@ -177,6 +204,37 @@ evidence of safety.
 | `worst_victim_rate` | > 0.3 | the candidate destroys one specific skill |
 
 Exit codes are a contract: **0** clean, **1** a gate failed, **2** could not be scored.
+
+### Thin query sets don't gate
+
+A rate needs at least **5 routable queries** under it to decide an exit code. At 3 queries
+the smallest non-zero `worst_victim_rate` is 0.333 — already over the gate — so a single
+stolen query would fail the run on quantisation noise rather than evidence.
+
+Below that floor the rate is still computed and reported, and the reason it wasn't gated
+is named in `advisory`. Not gating is **not** a clean bill:
+
+```sh
+$ skilleval contend cloudflare
+{
+  "worst_victim": "workers-best-practices",
+  "worst_victim_rate": 0.5,          # reported in full
+  "gated_victims": [],               # ...but nothing had 5+ queries behind it
+  "worst_gated_victim_rate": 0.0,
+  "gate": "pass",
+  "advisory": [
+    "worst_victim_rate 0.5 ('workers-best-practices') reported but not gated: that victim
+     has only 2 routable queries (need 5)."
+  ]
+}
+```
+
+The floor applies to *generated* query sets, which are a proxy a terse description
+starves. A hand-written `--queries` set is not a proxy — it is the author stating what the
+skill must win — so overridden sets are gated however small they are. If a skill is too
+terse to score, the fix is a wider description or a `--queries` file, not a lower gate.
+
+When *no* rate clears the floor, the run is unscorable (exit 2) rather than a pass.
 
 ## Tests
 
